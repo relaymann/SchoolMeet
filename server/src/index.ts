@@ -14,22 +14,14 @@ const allowedOrigins = (process.env.CLIENT_URL ?? "http://localhost:5173")
     .map((origin) => origin.trim())
     .filter(Boolean);
 
-app.use(cors({
-    origin: allowedOrigins,
-    methods: ["GET", "POST"],
-}));
+app.use(cors({ origin: allowedOrigins, methods: ["GET", "POST"] }));
 
 const io = new Server(server, {
-    cors: {
-        origin: allowedOrigins,
-        methods: ["GET", "POST"],
-    },
+    cors: { origin: allowedOrigins, methods: ["GET", "POST"] },
     transports: ["websocket", "polling"],
 });
 
-interface User {
-    socketId: string;
-}
+interface User { socketId: string; }
 
 let waitingUser: User | null = null;
 const userPairs: Record<string, string> = {};
@@ -48,8 +40,10 @@ const matchUser = (socket: Socket | undefined) => {
 
         userPairs[socket.id] = waitingUser.socketId;
         userPairs[waitingUser.socketId] = socket.id;
+
+        // Only the newly matched socket starts the offer. This prevents glare
+        // (both peers creating an offer at the same time).
         socket.emit("user:connect", waitingUser.socketId);
-        waitingSocket.emit("user:connect", socket.id);
         waitingUser = null;
         return;
     }
@@ -103,9 +97,7 @@ io.on("connection", (socket) => {
             io.to(partnerId).emit("skipped");
             delete userPairs[socket.id];
             delete userPairs[partnerId];
-
-            const partnerSocket = io.sockets.sockets.get(partnerId);
-            matchUser(partnerSocket);
+            matchUser(io.sockets.sockets.get(partnerId));
         }
 
         matchUser(socket);
@@ -121,15 +113,11 @@ io.on("connection", (socket) => {
             matchUser(io.sockets.sockets.get(partnerId));
         }
 
-        if (waitingUser?.socketId === socket.id) {
-            waitingUser = null;
-        }
+        if (waitingUser?.socketId === socket.id) waitingUser = null;
     });
 });
 
-app.get("/", (_req, res) => {
-    res.send("SchoolMeet server is running");
-});
+app.get("/", (_req, res) => res.send("SchoolMeet server is running"));
 
 const PORT = Number(process.env.PORT) || 8000;
 server.listen(PORT, "0.0.0.0", () => {
