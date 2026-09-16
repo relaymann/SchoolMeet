@@ -9,27 +9,15 @@ import { useTheme } from "../components/theme-provider";
 import { useNavigate } from "react-router-dom";
 import "../css/VideoChat.css";
 
-interface Offer {
-  offer: RTCSessionDescriptionInit;
-  from: string;
-}
-
-interface Answer {
-  answer: RTCSessionDescriptionInit;
-  from: string;
-}
-
-interface NegotiationDone {
-  answer: RTCSessionDescriptionInit;
-  to: string;
-}
+interface Offer { offer: RTCSessionDescriptionInit; from: string; }
+interface Answer { answer: RTCSessionDescriptionInit; from: string; }
+interface NegotiationDone { answer: RTCSessionDescriptionInit; to: string; }
 
 const VIDEO_CONSTRAINTS: MediaTrackConstraints = {
   width: { ideal: 640, max: 1280 },
   height: { ideal: 480, max: 720 },
   frameRate: { ideal: 24, max: 30 },
 };
-
 const AUDIO_CONSTRAINTS: MediaTrackConstraints = {
   echoCancellation: true,
   noiseSuppression: true,
@@ -41,7 +29,6 @@ export default function VideoChat() {
   const { socket } = useSocket();
   const navigate = useNavigate();
   const theme = useTheme();
-
   const [remoteSocketId, setRemoteSocketId] = useState<string | null>(null);
   const [myStream, setMyStream] = useState<MediaStream | null>(null);
   const [remoteStream, setRemoteStream] = useState<MediaStream | null>(null);
@@ -50,6 +37,7 @@ export default function VideoChat() {
   const [isScreenSharing, setIsScreenSharing] = useState(false);
   const [isCameraOn, setIsCameraOn] = useState(true);
   const [isMicOn, setIsMicOn] = useState(true);
+  const [peerVersion, setPeerVersion] = useState(0);
 
   const localVideoRef = useRef<HTMLVideoElement>(null);
   const remoteVideoRef = useRef<HTMLVideoElement>(null);
@@ -59,6 +47,7 @@ export default function VideoChat() {
   const remoteIdRef = useRef<string | null>(null);
   const negotiatingRef = useRef(false);
   const makingOfferRef = useRef(false);
+  const pendingIceRef = useRef<RTCIceCandidateInit[]>([]);
 
   const loaderColor = theme.theme === "dark" ? "#D1D5DB" : "#4B5563";
 
@@ -75,11 +64,7 @@ export default function VideoChat() {
 
   const getUserStream = useCallback(async () => {
     if (localStreamRef.current?.active) return localStreamRef.current;
-
-    const stream = await navigator.mediaDevices.getUserMedia({
-      video: VIDEO_CONSTRAINTS,
-      audio: AUDIO_CONSTRAINTS,
-    });
+    const stream = await navigator.mediaDevices.getUserMedia({ video: VIDEO_CONSTRAINTS, audio: AUDIO_CONSTRAINTS });
     attachLocalStream(stream);
     return stream;
   }, [attachLocalStream]);
@@ -87,11 +72,10 @@ export default function VideoChat() {
   const addLocalTracks = useCallback(async () => {
     const stream = await getUserStream();
     const peer = peerservice.peer;
-
     for (const track of stream.getTracks()) {
-      const existing = peer.getSenders().find((sender) => sender.track?.kind === track.kind);
-      if (!existing) peer.addTrack(track, stream);
-      else if (existing.track !== track) await existing.replaceTrack(track);
+      const sender = peer.getSenders().find((item) => item.track?.kind === track.kind);
+      if (!sender) peer.addTrack(track, stream);
+      else if (sender.track !== track) await sender.replaceTrack(track);
     }
   }, [getUserStream]);
 
@@ -100,23 +84,19 @@ export default function VideoChat() {
       if (!sender.track) continue;
       const parameters = sender.getParameters();
       if (!parameters.encodings?.length) parameters.encodings = [{}];
-
       if (sender.track.kind === "video") {
         parameters.encodings[0].maxBitrate = 1_200_000;
         parameters.encodings[0].maxFramerate = 30;
-        parameters.encodings[0].scaleResolutionDownBy = 1;
       } else if (sender.track.kind === "audio") {
         parameters.encodings[0].maxBitrate = 64_000;
       }
-
-      sender.setParameters(parameters).catch(() => undefined);
+      void sender.setParameters(parameters).catch(() => undefined);
     }
   }, []);
 
   const createOfferAndSend = useCallback(async (eventName: "offer" | "peer:nego:needed") => {
     const target = remoteIdRef.current;
     if (!socket || !target || makingOfferRef.current || peerservice.peer.signalingState !== "stable") return;
-
     makingOfferRef.current = true;
     try {
       await addLocalTracks();
@@ -135,6 +115,8 @@ export default function VideoChat() {
     peerservice.initPeer();
     negotiatingRef.current = false;
     makingOfferRef.current = false;
+    pendingIceRef.current = [];
+    setPeerVersion((value) => value + 1);
   }, []);
 
   const handleUserJoined = useCallback(async (remoteId: string) => {
@@ -150,6 +132,8 @@ export default function VideoChat() {
       const answer = await peerservice.getAnswer(offer);
       setSenderBitrates();
       if (socket && answer) socket.emit("answer", { answer, to: from });
+      for (const candidate of pendingIceRef.current) await peerservice.peer.addIceCandidate(candidate);
+      pendingIceRef.current = [];
     } catch (error) {
       console.error("Failed to handle WebRTC offer:", error);
     }
@@ -160,6 +144,8 @@ export default function VideoChat() {
       if (peerservice.peer.signalingState === "have-local-offer") {
         await peerservice.setRemoteDescription(answer);
         setSenderBitrates();
+        for (const candidate of pendingIceRef.current) await peerservice.peer.addIceCandidate(candidate);
+        pendingIceRef.current = [];
       }
     } catch (error) {
       console.error("Failed to handle WebRTC answer:", error);
@@ -169,19 +155,16 @@ export default function VideoChat() {
   const handleNegotiationNeeded = useCallback(async () => {
     if (negotiatingRef.current) return;
     negotiatingRef.current = true;
-    try {
-      await createOfferAndSend("peer:nego:needed");
-    } finally {
-      negotiatingRef.current = false;
-    }
+    try { await createOfferAndSend("peer:nego:needed"); }
+    finally { negotiatingRef.current = false; }
   }, [createOfferAndSend]);
 
   const handleIncomingNegotiation = useCallback(async ({ offer, from }: Offer) => {
     try {
-      if (peerservice.peer.signalingState !== "stable" && peerservice.peer.signalingState !== "have-local-offer") return;
+      if (peerservice.peer.signalingState !== "stable") return;
       const answer = await peerservice.getAnswer(offer);
       setSenderBitrates();
-      socket?.emit("peer:nego:done", { answer, to: from });
+      if (answer) socket?.emit("peer:nego:done", { answer, to: from });
     } catch (error) {
       console.error("Failed to negotiate WebRTC connection:", error);
     }
@@ -199,19 +182,18 @@ export default function VideoChat() {
   }, [setSenderBitrates]);
 
   const cleanupConnection = useCallback(() => {
-    peerservice.peer.onicecandidate = null;
-    peerservice.peer.ontrack = null;
-    peerservice.peer.onnegotiationneeded = null;
-    resetPeer();
+    if (peerservice.peer.signalingState !== "closed") peerservice.peer.close();
+    peerservice.initPeer();
+    setPeerVersion((value) => value + 1);
+    negotiatingRef.current = false;
+    makingOfferRef.current = false;
+    pendingIceRef.current = [];
     setRemoteStream(null);
     setRemoteId(null);
     setMessagesArray([]);
-  }, [resetPeer, setRemoteId]);
+  }, [setRemoteId]);
 
-  const handlePartnerDisconnected = useCallback(() => {
-    cleanupConnection();
-  }, [cleanupConnection]);
-
+  const handlePartnerDisconnected = useCallback(() => cleanupConnection(), [cleanupConnection]);
   const handleSkip = useCallback(() => {
     cleanupConnection();
     socket?.emit("skip");
@@ -221,22 +203,16 @@ export default function VideoChat() {
     const stream = localStreamRef.current;
     if (!stream) return;
     const track = stream.getVideoTracks()[0];
-
-    if (track && isCameraOn) {
-      track.enabled = false;
-      setIsCameraOn(false);
+    if (track) {
+      track.enabled = !isCameraOn;
+      setIsCameraOn(!isCameraOn);
       return;
     }
-
-    if (!track) {
-      const camera = await navigator.mediaDevices.getUserMedia({ video: VIDEO_CONSTRAINTS });
-      const newTrack = camera.getVideoTracks()[0];
-      stream.addTrack(newTrack);
-      const sender = peerservice.peer.getSenders().find((s) => s.track?.kind === "video");
-      if (sender) await sender.replaceTrack(newTrack);
-    } else {
-      track.enabled = true;
-    }
+    const camera = await navigator.mediaDevices.getUserMedia({ video: VIDEO_CONSTRAINTS });
+    const newTrack = camera.getVideoTracks()[0];
+    stream.addTrack(newTrack);
+    const sender = peerservice.peer.getSenders().find((s) => s.track?.kind === "video");
+    if (sender) await sender.replaceTrack(newTrack);
     setIsCameraOn(true);
   }, [isCameraOn]);
 
@@ -244,13 +220,11 @@ export default function VideoChat() {
     const stream = localStreamRef.current;
     if (!stream) return;
     const track = stream.getAudioTracks()[0];
-
     if (track) {
       track.enabled = !isMicOn;
       setIsMicOn(!isMicOn);
       return;
     }
-
     const microphone = await navigator.mediaDevices.getUserMedia({ audio: AUDIO_CONSTRAINTS });
     const newTrack = microphone.getAudioTracks()[0];
     stream.addTrack(newTrack);
@@ -261,7 +235,6 @@ export default function VideoChat() {
 
   const handleScreenShare = useCallback(async () => {
     const videoSender = peerservice.peer.getSenders().find((s) => s.track?.kind === "video");
-
     if (isScreenSharing) {
       const cameraTrack = localStreamRef.current?.getVideoTracks()[0];
       if (videoSender && cameraTrack) await videoSender.replaceTrack(cameraTrack);
@@ -271,23 +244,16 @@ export default function VideoChat() {
       setIsScreenSharing(false);
       return;
     }
-
     try {
-      const stream = await navigator.mediaDevices.getDisplayMedia({
-        video: { frameRate: { ideal: 20, max: 30 } },
-        audio: false,
-      });
+      const stream = await navigator.mediaDevices.getDisplayMedia({ video: { frameRate: { ideal: 20, max: 30 } }, audio: false });
       screenStreamRef.current = stream;
       setScreenStream(stream);
-      if (screenVideoRef.current) screenVideoRef.current.srcObject = stream;
-
       const screenTrack = stream.getVideoTracks()[0];
       if (videoSender) await videoSender.replaceTrack(screenTrack);
       setIsScreenSharing(true);
-
       screenTrack.addEventListener("ended", () => {
         const cameraTrack = localStreamRef.current?.getVideoTracks()[0];
-        if (cameraTrack) videoSender?.replaceTrack(cameraTrack).catch(() => undefined);
+        if (cameraTrack) void videoSender?.replaceTrack(cameraTrack).catch(() => undefined);
         setIsScreenSharing(false);
         screenStreamRef.current = null;
         setScreenStream(null);
@@ -305,38 +271,27 @@ export default function VideoChat() {
     const peer = peerservice.peer;
     peer.ontrack = (event) => {
       const stream = event.streams[0];
-      if (stream) {
-        setRemoteStream(stream);
-        if (remoteVideoRef.current) remoteVideoRef.current.srcObject = stream;
-      }
+      if (stream) setRemoteStream(stream);
     };
-
     peer.onicecandidate = (event) => {
-      if (event.candidate && remoteIdRef.current) {
-        socket?.emit("ice-candidate", { candidate: event.candidate, to: remoteIdRef.current });
-      }
+      if (event.candidate && remoteIdRef.current) socket?.emit("ice-candidate", { candidate: event.candidate, to: remoteIdRef.current });
     };
-
     peer.onnegotiationneeded = handleNegotiationNeeded;
-
     return () => {
       peer.ontrack = null;
       peer.onicecandidate = null;
       peer.onnegotiationneeded = null;
     };
-  }, [handleNegotiationNeeded, socket]);
+  }, [handleNegotiationNeeded, peerVersion, socket]);
 
   useEffect(() => {
     if (!socket) return;
-
     const onIceCandidate = async ({ candidate }: { candidate: RTCIceCandidateInit }) => {
       try {
-        await peerservice.peer.addIceCandidate(candidate);
-      } catch (error) {
-        console.error("Failed to add ICE candidate:", error);
-      }
+        if (peerservice.peer.remoteDescription) await peerservice.peer.addIceCandidate(candidate);
+        else pendingIceRef.current.push(candidate);
+      } catch (error) { console.error("Failed to add ICE candidate:", error); }
     };
-
     socket.on("user:connect", handleUserJoined);
     socket.on("offer", handleIncomingOffer);
     socket.on("answer", handleIncomingAnswer);
@@ -345,7 +300,6 @@ export default function VideoChat() {
     socket.on("ice-candidate", onIceCandidate);
     socket.on("skipped", handlePartnerDisconnected);
     socket.on("partnerDisconnected", handlePartnerDisconnected);
-
     return () => {
       socket.off("user:connect", handleUserJoined);
       socket.off("offer", handleIncomingOffer);
@@ -358,24 +312,14 @@ export default function VideoChat() {
     };
   }, [handleFinalNegotiation, handleIncomingAnswer, handleIncomingNegotiation, handleIncomingOffer, handlePartnerDisconnected, handleUserJoined, socket]);
 
-  useEffect(() => {
-    if (localVideoRef.current) localVideoRef.current.srcObject = myStream;
-  }, [myStream]);
+  useEffect(() => { if (localVideoRef.current) localVideoRef.current.srcObject = myStream; }, [myStream]);
+  useEffect(() => { if (remoteVideoRef.current) remoteVideoRef.current.srcObject = remoteStream; }, [remoteStream]);
+  useEffect(() => { if (screenVideoRef.current) screenVideoRef.current.srcObject = screenStream; }, [screenStream]);
 
-  useEffect(() => {
-    if (remoteVideoRef.current) remoteVideoRef.current.srcObject = remoteStream;
-  }, [remoteStream]);
-
-  useEffect(() => {
-    if (screenVideoRef.current) screenVideoRef.current.srcObject = screenStream;
-  }, [screenStream]);
-
-  useEffect(() => {
-    return () => {
-      localStreamRef.current?.getTracks().forEach((track) => track.stop());
-      screenStreamRef.current?.getTracks().forEach((track) => track.stop());
-      if (peerservice.peer.signalingState !== "closed") peerservice.peer.close();
-    };
+  useEffect(() => () => {
+    localStreamRef.current?.getTracks().forEach((track) => track.stop());
+    screenStreamRef.current?.getTracks().forEach((track) => track.stop());
+    if (peerservice.peer.signalingState !== "closed") peerservice.peer.close();
   }, []);
 
   const handleCleanup = useCallback(() => {
@@ -395,45 +339,24 @@ export default function VideoChat() {
     <div className="flex flex-col lg:flex-row w-screen bg-gradient-to-b from-gray-200 to-gray-400 dark:from-gray-800 dark:to-gray-900 transition-colors duration-300">
       <div className="lg:w-[450px] w-full lg:h-[calc(100vh-64px)] h-auto border-b lg:border-b-0 lg:border-r border-gray-300 dark:border-gray-700 bg-white dark:bg-gray-800 shadow-xl rounded-lg overflow-hidden">
         <div className="relative w-full h-64 lg:h-1/2 bg-gray-400 dark:bg-gray-700">
-          {myStream ? (
-            <video ref={localVideoRef} autoPlay muted playsInline className="absolute inset-0 w-full h-full object-cover rounded-lg" />
-          ) : (
-            <div className="flex flex-col items-center justify-center w-full h-full">
-              <ClipLoader color={loaderColor} size={50} />
-              <p className="text-gray-600 dark:text-gray-300 mt-2">Loading your stream...</p>
-            </div>
-          )}
+          {myStream ? <video ref={localVideoRef} autoPlay muted playsInline className="absolute inset-0 w-full h-full object-cover rounded-lg" /> : <div className="flex flex-col items-center justify-center w-full h-full"><ClipLoader color={loaderColor} size={50} /><p className="text-gray-600 dark:text-gray-300 mt-2">Loading your stream...</p></div>}
           <div className="absolute bottom-0 left-0 bg-gradient-to-t from-black via-transparent to-transparent p-3 text-white text-sm">My Stream</div>
         </div>
-
         <div className="relative w-full h-64 lg:h-1/2 bg-gray-400 dark:bg-gray-700">
-          {remoteStream ? (
-            <video ref={remoteVideoRef} autoPlay playsInline className="absolute inset-0 w-full h-full object-cover rounded-lg" />
-          ) : (
-            <div className="flex flex-col items-center justify-center w-full h-full">
-              <ClipLoader color={loaderColor} size={50} />
-              <p className="text-gray-600 dark:text-gray-300 mt-2">Waiting for user to connect...</p>
-            </div>
-          )}
+          {remoteStream ? <video ref={remoteVideoRef} autoPlay playsInline className="absolute inset-0 w-full h-full object-cover rounded-lg" /> : <div className="flex flex-col items-center justify-center w-full h-full"><ClipLoader color={loaderColor} size={50} /><p className="text-gray-600 dark:text-gray-300 mt-2">Waiting for user to connect...</p></div>}
           <div className="absolute bottom-0 left-0 bg-gradient-to-t from-black via-transparent to-transparent p-3 text-white text-sm">Remote Stream</div>
         </div>
       </div>
-
       <div className="flex-1 flex flex-col w-full">
         <div className="p-4 border-b border-gray-200 dark:border-gray-700 flex flex-row gap-4 h-auto sm:h-16 shadow rounded-lg bg-gray-50 dark:bg-gray-900">
           <Button className="flex-1 p-2 gap-2 bg-red-600 text-white rounded-md" size="icon" onClick={handleCleanup}><StepBack size={18} /><span className="hidden sm:inline">Stop</span></Button>
           <Button className="flex-1 p-2 gap-2 bg-blue-600 text-white rounded-md" size="icon" onClick={handleSkip} disabled={!remoteSocketId}><StepForward size={18} /><span className="hidden sm:inline">Skip</span></Button>
-          <Button className="flex-1 p-2 gap-2 bg-green-600 text-white rounded-md" onClick={handleScreenShare} size="icon"><ScreenShare size={18} /><span className="hidden sm:inline">{isScreenSharing ? "Stop Sharing" : "Share Screen"}</span></Button>
+          <Button className="flex-1 p-2 gap-2 bg-green-600 text-white rounded-md" onClick={() => void handleScreenShare()} size="icon"><ScreenShare size={18} /><span className="hidden sm:inline">{isScreenSharing ? "Stop Sharing" : "Share Screen"}</span></Button>
           <Button className="flex-1 p-2 gap-2 bg-gray-600 text-white rounded-md" onClick={() => void toggleCamera()}>{isCameraOn ? "Turn Off Camera" : "Turn On Camera"}</Button>
           <Button className="flex-1 p-2 gap-2 bg-gray-600 text-white rounded-md" onClick={() => void toggleMic()}>{isMicOn ? "Turn Off Mic" : "Turn On Mic"}</Button>
         </div>
-
         <div className="flex-1 max-h-[calc(100vh-128px)] overflow-auto p-4 bg-white dark:bg-gray-800 rounded-lg shadow-inner">
-          {screenStream ? (
-            <video ref={screenVideoRef} autoPlay muted playsInline className="w-full h-full object-contain rounded-lg" />
-          ) : (
-            <Messages remoteSocketId={remoteSocketId} messagesArray={messagesArray} setMessagesArray={setMessagesArray} />
-          )}
+          {screenStream ? <video ref={screenVideoRef} autoPlay muted playsInline className="w-full h-full object-contain rounded-lg" /> : <Messages remoteSocketId={remoteSocketId} messagesArray={messagesArray} setMessagesArray={setMessagesArray} />}
         </div>
       </div>
     </div>
