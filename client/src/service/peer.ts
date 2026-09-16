@@ -1,61 +1,56 @@
 class PeerService {
     public peer!: RTCPeerConnection;
 
-    constructor(){
+    constructor() {
         this.initPeer();
     }
 
     initPeer() {
-        // Reinitialize peer connection
-        // console.log("init peer........")
-        if (this.peer && this.peer.signalingState !== 'closed') {
-            this.peer.getTransceivers().forEach(transceiver => {
-                if (transceiver && transceiver.stop) {
-                    transceiver.stop();
-                }
+        if (this.peer && this.peer.signalingState !== "closed") {
+            this.peer.close();
+        }
+
+        const iceServers: RTCIceServer[] = [
+            { urls: "stun:stun.l.google.com:19302" },
+        ];
+
+        // Optional TURN server for users behind restrictive NAT/firewalls.
+        // Configure VITE_TURN_SERVER, VITE_TURN_USERNAME and VITE_TURN_CREDENTIALS
+        // in the frontend environment when a TURN provider is available.
+        const turnServer = import.meta.env.VITE_TURN_SERVER;
+        const turnUsername = import.meta.env.VITE_TURN_USERNAME;
+        const turnCredential = import.meta.env.VITE_TURN_CREDENTIAL;
+
+        if (turnServer && turnUsername && turnCredential) {
+            iceServers.push({
+                urls: turnServer,
+                username: turnUsername,
+                credential: turnCredential,
             });
-            this.peer.close(); 
         }
 
         this.peer = new RTCPeerConnection({
-            iceServers: [{
-                urls: [
-                    "stun:stun.l.google.com:19302",
-                    "stun:stun1.l.google.com:19302",
-                    "stun:stun2.l.google.com:19302",
-                    "stun:stun3.l.google.com:19302",
-                    "stun:stun4.l.google.com:19302",
-                    "stun:global.stun.twilio.com:3478",
-                    "stun:stun.stunprotocol.org:3478",
-                    "stun:stun.voipstunt.com",
-                    "stun:stun.services.mozilla.com"
-                ]
-            }]
+            iceServers,
+            bundlePolicy: "max-bundle",
+            rtcpMuxPolicy: "require",
         });
     }
 
-    async getOffer(){
-        if(this.peer){
-            const offer = await this.peer.createOffer();
-            await this.peer.setLocalDescription(new RTCSessionDescription(offer));
-            return this.peer.localDescription;
-        }
-        
+    async getOffer() {
+        const offer = await this.peer.createOffer();
+        await this.peer.setLocalDescription(offer);
+        return this.peer.localDescription;
     }
 
-    async getAnswer(offer: RTCSessionDescriptionInit){
-        if(this.peer){
-            await this.peer.setRemoteDescription(offer);
-            const answer = await this.peer.createAnswer();
-            await this.peer.setLocalDescription(new RTCSessionDescription(answer));
-            return this.peer.localDescription;
-        }
+    async getAnswer(offer: RTCSessionDescriptionInit) {
+        await this.peer.setRemoteDescription(offer);
+        const answer = await this.peer.createAnswer();
+        await this.peer.setLocalDescription(answer);
+        return this.peer.localDescription;
     }
 
-    async setRemoteDescription(answer: RTCSessionDescriptionInit){
-        if(this.peer){
-            await this.peer.setRemoteDescription(new RTCSessionDescription(answer));
-        }
+    async setRemoteDescription(description: RTCSessionDescriptionInit) {
+        await this.peer.setRemoteDescription(description);
     }
 }
 
